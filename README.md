@@ -114,6 +114,10 @@ export FORCE_PG_TESTS=1
 python manage.py test payouts.tests.PayoutConcurrencyLiveTests -v 2
 ```
 
+### CI (runs concurrency test on Postgres)
+
+GitHub Actions runs `payouts.tests` using a disposable Postgres service with `FORCE_PG_TESTS=1`, so the concurrency test does not skip in CI.
+
 ## API overview
 
 - `POST /api/v1/payouts/` — headers: `Authorization: Token <key>`, `Idempotency-Key: <uuid>`; body: `{ "amount_paise": int, "bank_account_id": int }`
