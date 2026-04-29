@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from rest_framework import status
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.generics import ListCreateAPIView, RetrieveAPIView
@@ -89,6 +90,14 @@ class PayoutListCreateView(ListCreateAPIView):
         except Exception:
             # Idempotency snapshot is best-effort; DB record already enforces key uniqueness.
             pass
+
+        if created:
+            from .tasks import process_payout
+
+            if settings.ENABLE_ASYNC:
+                process_payout.delay(str(payout.id))
+            else:
+                process_payout(str(payout.id))
 
         return Response(data, status=status.HTTP_201_CREATED)
 
