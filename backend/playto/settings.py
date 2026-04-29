@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from django.core.exceptions import ImproperlyConfigured
 
 load_dotenv()
 
@@ -16,6 +17,40 @@ ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(","
 import sys
 
 _db_url = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
+if _db_url:
+    _db_url = _db_url.strip().strip("'\"")
+
+
+def _postgres_config_from_url(db_url: str) -> dict:
+    import urllib.parse as urlparse
+
+    parsed = urlparse.urlparse(db_url)
+    if not parsed.scheme or not parsed.hostname:
+        raise ImproperlyConfigured(
+            "DATABASE_URL is malformed. Use a full URL like "
+            "'postgresql://user:password@host:port/database'."
+        )
+    if not parsed.username:
+        raise ImproperlyConfigured(
+            "DATABASE_URL is missing username. For Supabase pooler use "
+            "'postgres.<project-ref>' as username."
+        )
+    if parsed.password is None:
+        raise ImproperlyConfigured(
+            "DATABASE_URL is missing password. Ensure special characters are URL-encoded."
+        )
+
+    return {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": parsed.path.lstrip("/") or "postgres",
+        "USER": parsed.username,
+        "PASSWORD": parsed.password,
+        "HOST": parsed.hostname,
+        "PORT": str(parsed.port or 5432),
+        "OPTIONS": {"sslmode": os.environ.get("PG_SSLMODE", "require")}
+        if parsed.hostname and "supabase" in parsed.hostname.lower()
+        else {},
+    }
 
 if (
     len(sys.argv) > 1
@@ -23,21 +58,8 @@ if (
     and os.environ.get("FORCE_PG_TESTS")
     and _db_url
 ):
-    import urllib.parse as urlparse
-
-    parsed = urlparse.urlparse(_db_url)
     DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": parsed.path.lstrip("/") or "postgres",
-            "USER": parsed.username or "postgres",
-            "PASSWORD": parsed.password or "",
-            "HOST": parsed.hostname or "localhost",
-            "PORT": str(parsed.port or 5432),
-            "OPTIONS": {"sslmode": os.environ.get("PG_SSLMODE", "require")}
-            if parsed.hostname and "supabase" in parsed.hostname.lower()
-            else {},
-        }
+        "default": _postgres_config_from_url(_db_url)
     }
 elif len(sys.argv) > 1 and sys.argv[1] == "test":
     DATABASES = {
@@ -48,21 +70,8 @@ elif len(sys.argv) > 1 and sys.argv[1] == "test":
         }
     }
 elif _db_url:
-    import urllib.parse as urlparse
-
-    parsed = urlparse.urlparse(_db_url)
     DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": parsed.path.lstrip("/") or "postgres",
-            "USER": parsed.username or "postgres",
-            "PASSWORD": parsed.password or "",
-            "HOST": parsed.hostname or "localhost",
-            "PORT": str(parsed.port or 5432),
-            "OPTIONS": {"sslmode": os.environ.get("PG_SSLMODE", "require")}
-            if parsed.hostname and "supabase" in parsed.hostname.lower()
-            else {},
-        }
+        "default": _postgres_config_from_url(_db_url)
     }
 else:
     DATABASES = {
