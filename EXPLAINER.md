@@ -1,99 +1,96 @@
-# Playto Payout Engine — EXPLAINER
+# Playto — what this project is
 
-Short, implementation-focused answers.
+This page explains the project in simple words. Read it once and you can tell someone else what Playto does without opening the code.
 
-## 1) Paste the balance query. Why derived and not stored?
+For setup steps and environment variables, open README.md.
 
-Balance is computed from `LedgerEntry` rows only (credits minus debits). Money in transit is represented as debits at payout creation time, so there is no separate “stored balance” that can drift from the ledger.
+For how money locking, idempotency, and the database work in detail, open EXPLAINER.md.
 
-```10:20:playto/backend/payouts/services.py
-def calculate_available_balance_paise(merchant: Merchant) -> int:
-    row = LedgerEntry.objects.filter(merchant=merchant).aggregate(
-        total=Sum(
-            Case(
-                When(entry_type=LedgerEntry.ENTRY_CREDIT, then=F("amount_paise")),
-                When(entry_type=LedgerEntry.ENTRY_DEBIT, then=-F("amount_paise")),
-                output_field=BigIntegerField(),
-            )
-        )
-    )
-    return row["total"] or 0
-```
+---
 
-**Why derived:** a stored balance would be a second source of truth that can disagree with ledger history after bugs, partial writes, or manual fixes. The ledger is the audit trail; the aggregate is the authoritative number.
+## One sentence
 
-## 2) Paste the `select_for_update()` block. What does it lock?
+Playto helps merchants get paid to their bank accounts. It keeps a clear money record (a ledger), runs payouts step by step (pending, then processing, then done or failed), and uses background jobs so the website stays responsive.
 
-```62:76:playto/backend/payouts/services.py
-    with transaction.atomic():
-        locked_merchant = Merchant.objects.select_for_update().get(pk=merchant.pk)
+---
 
-        now = timezone.now()
-        existing = (
-            Payout.objects.filter(
-                merchant=locked_merchant,
-                idempotency_key=idempotency_key,
-                idempotency_expires_at__gt=now,
-            )
-            .select_for_update()
-            .first()
-        )
-        if existing:
-            return existing, False
-```
+## What problem it solves
 
-**What it locks:** the `Merchant` row for `merchant.pk` is locked for update for the duration of the atomic block. On PostgreSQL this is a row-level lock on `merchants_merchant`. If an idempotent payout row already exists and matches the filter, that payout row is also locked (`select_for_update()` on the payout queryset) before returning it.
+Platforms that pay sellers or partners need three things:
 
-The lock serializes payout creation for a single merchant so two simultaneous spend attempts cannot both read the same pre-debit balance.
+- Balances must be right: you cannot pay out more than the merchant actually has.
+- The same payout request must not run twice by accident (retries, double clicks).
+- There should be a history you can trust: what was credited, debited, and what happened to each payout.
 
-## 3) How is idempotency checked? What happens on concurrent duplicate?
+Playto builds those rules into the product.
 
-Inside the same `transaction.atomic()` block as the merchant lock, we look for an existing non-expired payout with the same `(merchant, idempotency_key)` (`idempotency_expires_at > now`). If found, we return that payout and the API responds with the same serialized payload and `201` (per product requirement).
+---
 
-**Concurrent duplicate:** two requests with the same key hit the same merchant row lock. The second blocks on `Merchant.objects.select_for_update()` until the first commits, then re-runs the lookup and returns the existing payout instead of inserting a second row.
+## Main ideas
 
-## 4) Where is `failed -> completed` blocked? Paste the check.
+Merchant: a seller or business that receives payouts. Each merchant is linked to a login in the app.
 
-`failed` is not a key in `LEGAL_TRANSITIONS`, so `LEGAL_TRANSITIONS.get(self.status, [])` is empty for a failed payout and any transition is rejected.
+Bank account: where the money is sent. A merchant can save more than one account.
 
-```63:66:playto/backend/payouts/models.py
-    LEGAL_TRANSITIONS = {
-        STATUS_PENDING: [STATUS_PROCESSING],
-        STATUS_PROCESSING: [STATUS_COMPLETED, STATUS_FAILED],
-    }
-```
+Ledger: a list of money movements. Credits add money; debits reserve or pay out money. We figure out “how much is available” by adding up the ledger, instead of keeping a separate balance number that could get out of sync.
 
-```119:123:playto/backend/payouts/models.py
-    def transition_to(self, new_status):
-        if new_status not in self.LEGAL_TRANSITIONS.get(self.status, []):
-            raise IllegalStateTransition(
-                f"{self.status} -> {new_status} is not allowed"
-            )
-```
+Payout: one attempt to send a fixed amount to one bank account. It has a status that moves forward (for example from pending to processing to completed or failed).
 
-## 5) One place AI wrote subtly wrong code — what was it, what did you fix?
+Money is stored in paise (100 paise = 1 rupee) as whole numbers so we avoid rounding mistakes.
 
-**Celery payout pickup + bank simulation in one database transaction.** An early version ran the random “bank” outcome inside the same `transaction.atomic()` that moved `pending -> processing`. If the simulator raised (or an illegal transition occurred), Django rolled back the whole atomic block, undoing the move to `processing` even though the payout should remain in-flight for retries.
+---
 
-**Fix:** split `process_payout` into two short atomic sections: first commit `pending -> processing` and bump `attempts` / `last_bank_sim_at`, then open a second atomic block to run `_run_bank_simulation` so a simulation failure cannot roll back the processing transition.
+## What happens when someone requests a payout
 
-```33:48:playto/backend/payouts/tasks.py
-    with transaction.atomic():
-        try:
-            p = Payout.objects.select_for_update().get(pk=pk, status=Payout.STATUS_PENDING)
-        except Payout.DoesNotExist:
-            return
-        p.transition_to(Payout.STATUS_PROCESSING)
-        p.attempts += 1
-        p.last_bank_sim_at = timezone.now()
-        p.save(update_fields=["attempts", "last_bank_sim_at", "updated_at"])
-    with transaction.atomic():
-        try:
-            p2 = Payout.objects.select_for_update().get(pk=pk, status=Payout.STATUS_PROCESSING)
-        except Payout.DoesNotExist:
-            return
-        try:
-            _run_bank_simulation(p2)
-```
+1. The merchant calls the API with a token and asks to send a certain amount to a bank account.
+2. The system checks the rules and sets aside the money so two requests at the same time cannot overspend.
+3. Background workers (Celery) run on a timer. They act like talking to a bank (in this project that part can be simulated). Then they mark the payout as completed or failed. Failed payouts cannot be flipped back to completed by mistake; see EXPLAINER.md if you want the exact rules.
+4. The React dashboard shows merchants, balances, and activity. The API is what other systems should call for real integrations.
 
-**Testing note:** the concurrent HTTP test is skipped on SQLite because row-locking semantics differ; run it with `FORCE_PG_TESTS=1` and a real Postgres `DATABASE_URL` (see `README.md`).
+---
+
+## Parts of the system
+
+Django REST API: paths under /api/v1/ … login tokens, create and list payouts, and a “me” endpoint for the merchant with balances and bank accounts.
+
+React web app: the dashboard people click through. In development it often talks to Django through a proxy.
+
+PostgreSQL: the main database in production (for example on Supabase). For local work without Postgres, the backend can use SQLite.
+
+Redis and Celery: Redis is a message broker; Celery runs scheduled tasks that process pending payouts and fix stuck ones.
+
+Docker Compose can start the web app, workers, scheduler, and Redis together. The database is usually hosted separately.
+
+---
+
+## Short glossary
+
+Derived balance: the balance we calculate from ledger rows, not a separate stored wallet field.
+
+Idempotency key: a value the client sends so if the same payout is submitted twice, we return the same result instead of paying twice.
+
+Token auth: the API expects a header like Authorization: Token followed by your key. Seed scripts can print tokens for local testing.
+
+---
+
+## Why it is built this way
+
+The ledger plus strict payout statuses gives an audit trail and keeps money math honest.
+
+Important requests lock data briefly so two clicks cannot both pass a balance check at once.
+
+Heavy work runs in workers instead of inside one slow web request.
+
+---
+
+## Where to read more
+
+README.md — how to install, run migrations, Celery, and tests.
+
+EXPLAINER.md — deeper technical notes for developers.
+
+---
+
+## One line you can reuse
+
+Playto is a payout system for merchants: ledger-backed balances, safe payout states, and background workers so platforms can pay banks without double-paying or losing a clear history.
