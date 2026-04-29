@@ -2,7 +2,7 @@ import uuid
 
 from django.conf import settings
 from rest_framework import status
-from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.exceptions import APIException, NotFound, ValidationError
 from rest_framework.generics import ListCreateAPIView, RetrieveAPIView
 from rest_framework.response import Response
 from django.utils import timezone
@@ -24,8 +24,14 @@ class PaymentRequiredException(APIException):
 class PayoutListCreateView(ListCreateAPIView):
     serializer_class = PayoutSerializer
 
+    def _get_merchant(self):
+        try:
+            return Merchant.objects.get(user=self.request.user)
+        except Merchant.DoesNotExist as exc:
+            raise NotFound("Merchant profile not found for this user.") from exc
+
     def get_queryset(self):
-        merchant = Merchant.objects.get(user=self.request.user)
+        merchant = self._get_merchant()
         return Payout.objects.filter(merchant=merchant).select_related(
             "bank_account", "merchant"
         )
@@ -45,7 +51,7 @@ class PayoutListCreateView(ListCreateAPIView):
 
         ser = PayoutCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        merchant = Merchant.objects.get(user=request.user)
+        merchant = self._get_merchant()
 
         # Fast path: exact replay for active idempotency keys (even if payout changed).
         now = timezone.now()
@@ -109,7 +115,10 @@ class PayoutDetailView(RetrieveAPIView):
     serializer_class = PayoutSerializer
 
     def get_queryset(self):
-        merchant = Merchant.objects.get(user=self.request.user)
+        try:
+            merchant = Merchant.objects.get(user=self.request.user)
+        except Merchant.DoesNotExist as exc:
+            raise NotFound("Merchant profile not found for this user.") from exc
         return Payout.objects.filter(merchant=merchant).select_related(
             "bank_account", "merchant"
         )
